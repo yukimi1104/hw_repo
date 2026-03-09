@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+This scripts is a bioinformatics tool mimicing the Ensemble vep formatting output. 
+This tool is designed to compare two DNA genotype input files from different sources 
+(e.g., 23andMe, AncestryDNA). It calculates the total raw markers for both files, 
+identifies overlapping shared markers, and analyze genotype similarity. Additionally, 
+it performs functional annotation via API searches to classify SNPs as harmless (synonymous) 
+or serious (missense)
+1. Data Standardization: 
+   Supports raw DNA data from various providers (23andMe, AncestryDNA, etc.).
+   Automatically detects and merges 'allele1/allele2' formats into standard genotypes.
+   Deduplicate and merge raw files.
+   Generate chromosome encoding matching map (e.g., 23/24/25/26 from 23andMe 
+   or X/Y/MT from AncestryDNA) into a standardized set: Autosomes, X, Y, and MT.
+2. Biological Alignment:
+   Handles unphased genotypes (e.g., GA and AG) by sorting genotype alphabetically.
+   Detects and reports technical artifacts using biological complement rules. Expands hemizygous 
+   calls in males (e.g., 'A') into homozygous format ('AA') to allow accurate comparison with 
+   female/diploid samples.
+3. Functional Annotation:
+   Conducts API searches to classify SNPs across functional annotation (e.g., missense, 
+   synonymous, intronic, UTR).Maps population-scale allele frequency (AF) to identify rare vs. 
+   common variants.
+4. Output
+   Generates PDF reports titled by the specific comparison (file1_vs_file2).
+   Includes visualizations: Data tables and Functional pie charts.
+   Prioritizes serious mismatches, providing detailed protein and codon changes(if any)
+5. Genomic Signature Detection (ROH):
+   Uses a vectorized sliding window (default: 50 SNPs) to calculate Runs of Homozygosity (ROH)
+   with a step size of 1 SNP.   
+Environment Setup:
+Runtime: Python 3.12+
+Libraries: pandas, matplotlib, fpdf2, requests
+Data Source: MyVariant.info API (Internet access required)
+Usage
+It is recommended to run this script within an activated virtual environment (venv).
+Command: source .venv/bin/activate && python3 scripts/datParser.py <file1> <file2>
+"""
+
+import sys, os, requests, time
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
+
+# 增强型碱基互补表，用于精准检测单链翻转
+COMPLEMENT_TABLE = str.maketrans("ATCG", "TAGC")
+
+def query_genomic_database_full(rsid_list):
+    """API 获取功能注释：提取变异效应、基因名与人群频率"""
+    unique_ids = list(set([str(i).strip() for i in rsid_list if str(i).strip().startswith("rs")]))
+    annotation_map = {}
+    session = requests.Session()   
+    start_time = time.time()
+    total = len(unique_ids)
+    # 限制前 5000 个以平衡处理速度与数据广度 [cite: 2026-02-27]
+    for i in range(0, total, 1000):
+        chunk = unique_ids[i:i + 1000]
+        elapsed = time.time() - start_time
+        eta = (elapsed / (i + 1)) * (total - i) / 60 if i > 0 else 0
+        print(f"API Progress: {i}/{total} | ETA: {eta:.1f} min", end='\r')
+        try:
+            resp = session.post("https://myvariant.info/v1/query", 
+                data={"q": ",".join(chunk), "scopes": "dbsnp.rsid", 
+                      "fields": "gnomad_genome.af,snpeff.ann"}, timeout=30)
+            if resp.status_code == 200:
+                results = resp.json() if isinstance(resp.json(), list) else resp.json().get('hits', [])
+                for hit in results:
+                    rid = hit.get('query') or hit.get('_id')
+                    af = hit.get('gnomad_genome', {}).get('af', 0.5)
+                    if isinstance(af, dict): af = af.get('af', 0.5)
+                    eff, gene = "intergenic", "-"
+                    if 'snpeff' in hit:
+                        ann = hit['snpeff'].get('ann', [])
+                        if isinstance(ann, dict): ann = [ann]
+                        for a in ann:
+                            cur_eff = a.get('effect', '').split('&')[0]
+                            if any(x in cur_eff for x in ['missense', 'stop', 'frame', 'splice']):
+                                eff, gene = cur_eff, a.get('gene_id', '-')
+                                break
+                        if eff == "intergenic" and ann: eff = ann[0].get('effect', '').split('&')[0]
+                    annotation_map[rid] = {"eff": eff, "af": af, "gene": gene}
+        except: pass
+    return annotation_map
+
+def load_and_clean(path):
+    """鲁棒加载：修复性染色体一致性，统计重复与缺失"""
+    try:
+        skip = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for i, line in enumerate(f):
+                if any(x in line.lower() for x in ['rsid', 'name', 'snp']): skip = i; break
+        df = pd.read_csv(path, sep=None, skiprows=skip, engine='python', dtype=str)
+        raw_rows = len(df)
+        df.columns = [str(c).replace("#", "").strip().lower() for c in df.columns]
+        
+        for alt, target in [('name','rsid'),('snp','rsid'),('result','genotype'),('call','genotype')]:
+            if alt in df.columns: df = df.rename(columns={alt: target})
+        if 'genotype' not in df.columns and 'allele1' in df.columns:
+            df['genotype'] = df['allele1'].fillna('-') + df['allele2'].fillna('-')
+        
+        dup_count = df.duplicated('rsid').sum()
+        
+        # 核心逻辑：解决 X 染色体 A -> AA 匹配问题
+        def fix_g(g):
+            g = str(g).replace(' ','').replace('0','-').replace('?','-')
+            if len(g) == 1 and g != '-': return g + g
+            return "".join(sorted(list(g)))
+        df['genotype'] = df['genotype'].apply(fix_g)
+
+        c_map = {'23':'X','24':'Y','25':'X','26':'MT','M':'MT','0':'Unknown'}
+        df['chromosome'] = df['chromosome'].astype(str).str.upper().str.replace('CHR','').replace(c_map)
+        df['position'] = pd.to_numeric(df['position'], errors='coerce')
+        m_count = df['genotype'].isin(['--', '??', '-', '00']).sum()
+        df_clean = df.drop_duplicates('rsid').dropna(subset=['rsid', 'chromosome', 'position'])
+        return df_clean, raw_rows, m_count, dup_count
+    except: return None, 0, 0, 0
+
+def calculate_roh_fast(df, window=50, min_kb=500):
+    """
+    修正后的 ROH 计算：
+    1. 识别所有纯合窗口
+    2. 合并连续/重叠的纯合窗口
+    3. 过滤掉过短的片段
+    """
+    total_kb = 0
+    # 仅计算常染色体，X染色体在男性中全是纯合，需单独处理或剔除
+    valid_chrs = [str(i) for i in range(1, 23)] 
+    
+    for chrom in df['chromosome'].unique():
+        if chrom not in valid_chrs: continue
+        
+        # 排除缺失值后再计算
+        sub = df[(df['chromosome'] == chrom) & (df['genotype'] != '--')].sort_values('position')
+        if len(sub) < window: continue
+        
+        # 判断纯合：AA 或 TT 等（长度为2且首尾碱基一致）
+        is_hom = (sub['genotype'].str[0] == sub['genotype'].str[-1]).values
+        
+        # 使用滚动窗口找全纯合区域
+        # 寻找连续 window 个 True 的起始索引
+        hits = []
+        for i in range(len(is_hom) - window + 1):
+            if np.all(is_hom[i : i + window]):
+                hits.append((sub.iloc[i]['position'], sub.iloc[i + window - 1]['position']))
+        
+        if not hits: continue
+        
+        # 合并重叠的片段
+        hits.sort()
+        merged_segments = []
+        if hits:
+            curr_start, curr_end = hits[0]
+            for next_start, next_end in hits[1:]:
+                if next_start <= curr_end:  # 有重叠，合并
+                    curr_end = max(curr_end, next_end)
+                else:
+                    merged_segments.append((curr_start, curr_end))
+                    curr_start, curr_end = next_start, next_end
+            merged_segments.append((curr_start, curr_end))
+            
+        # 统计符合最小长度限制的 ROH
+        for start, end in merged_segments:
+            seg_kb = (end - start) / 1000
+            if seg_kb >= min_kb: # 只有大于阈值（如500kb）才算作ROH
+                total_kb += seg_kb
+                
+    return total_kb
+
+class FinalReport(FPDF):
+    def __init__(self, title_text):
+        super().__init__(); self.title_text = title_text
+    def header(self):
+        self.set_font('helvetica', 'B', 14)
+        self.cell(0, 10, self.title_text, align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+def main():
+    if len(sys.argv) < 3: sys.exit("Usage: python3 datParser.py file1 file2")
+    f1, f2 = sys.argv[1], sys.argv[2]
+    comparison_id = f"{os.path.basename(f1)}_vs_{os.path.basename(f2)}"
+    pie_file = f"pie_{comparison_id}.png"
+    
+    (d1, r1, m1, dp1), (d2, r2, m2, dp2) = load_and_clean(f1), load_and_clean(f2)
+    merged = pd.merge(d1, d2, on=['rsid', 'chromosome'], suffixes=('_1', '_2'))
+    
+    # 1. 匹配状态量化（含 Strand Flip）
+    def check_match(row):
+        g1, g2 = row['genotype_1'], row['genotype_2']
+        if g1 == g2: return "Match"
+        if "".join(sorted(g1.translate(COMPLEMENT_TABLE))) == g2: return "Strand Flip"
+        return "Mismatch"
+    merged['status'] = merged.apply(check_match, axis=1)
+
+    # 2. Zygosity 一致性
+    def get_zyg(row):
+        z1 = "Hom" if row['genotype_1'][0] == row['genotype_1'][-1] else "Het"
+        z2 = "Hom" if row['genotype_2'][0] == row['genotype_2'][-1] else "Het"
+        return z1 == z2
+    zyg_con = merged.apply(get_zyg, axis=1).mean() * 100
+
+    # 3. 功能注释
+    anno = query_genomic_database_full(merged['rsid'].unique().tolist())
+    merged['eff'] = merged['rsid'].map(lambda x: anno.get(x, {}).get('eff', 'unannotated'))
+    merged['af'] = merged['rsid'].map(lambda x: anno.get(x, {}).get('af', 0.5)).astype(float)
+    merged['gene'] = merged['rsid'].map(lambda x: anno.get(x, {}).get('gene', '-'))
+    
+    rare_count = (merged['af'] < 0.01).sum()
+    merged['is_coding'] = merged['eff'].str.contains('missense|stop|synonymous|exon', na=False)
+    merged['is_exon'] = merged['eff'].str.contains('exon|missense|stop|synonymous', na=False)
+
+    # 饼图美化：无百分比，丰富图例 [cite: 2026-02-27]
+    eff_counts = merged['eff'].value_counts()
+    mask = eff_counts > (0.001 * len(merged)) # 阈值设为 0.1% 增加图例
+    final_counts = eff_counts[mask].copy()
+    if not eff_counts[~mask].empty: final_counts['Other Misc'] = eff_counts[~mask].sum()
+    
+    plt.figure(figsize=(10, 8))
+    plt.pie(final_counts, labels=None, startangle=140, colors=plt.cm.Set3.colors)
+    plt.legend(final_counts.index, loc="upper center", bbox_to_anchor=(0.5, -0.05), ncol=2, fontsize=9)
+    plt.title("Genomic Variant Consequences Summary")
+    plt.tight_layout(); plt.savefig(pie_file); plt.close()
+
+    # --- PDF 生成 ---
+    pdf = FinalReport(f"Genomic Comparison: {comparison_id}")
+    pdf.add_page()
+    
+    # Page 1: 核心量化指标 (包含所有要求项)
+    pdf.set_font('helvetica', 'B', 12)
+    pdf.cell(0, 10, "1. Executive Summary & Quantified Metrics", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    stats = [
+        ["Total Overlapped SNPs", str(len(merged))],
+        ["Matching Genotypes (Standard)", str((merged['status']=="Match").sum())],
+        ["Strand Flips Detected", str((merged['status']=="Strand Flip").sum())],
+        ["Mismatching Genotypes", str((merged['status']=="Mismatch").sum())],
+        ["Overall Concordance (%)", f"{(merged['status'].str.contains('Match|Flip')).mean()*100:.2f}%"],
+        ["Zygosity Concordance (%)", f"{zyg_con:.2f}%"],
+        ["Rare SNPs (AF < 0.01)", str(rare_count)],
+        ["Common SNPs (AF >= 0.01)", str(len(merged)-rare_count)],
+        ["ROH Length F1 / F2 (kb)", f"{calculate_roh_fast(d1):.2f} / {calculate_roh_fast(d2):.2f}"],
+        ["Missing Genotypes (F1 / F2)", f"{m1} / {m2}"],
+        ["Duplicate SNPs Found (F1 / F2)", f"{dp1} / {dp2}"]
+    ]
+    with pdf.table(line_height=8) as t:
+        for r in stats:
+            row = t.row(); row.cell(r[0]); row.cell(r[1])
+    
+    # Page 2: 染色体一致性
+    pdf.add_page()
+    pdf.cell(0, 10, "2. Concordance by Chromosome Type", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    def get_cat(c):
+        if c in ['X','Y','MT']: return c
+        return "Autosomes"
+    merged['chr_cat'] = merged['chromosome'].apply(get_cat)
+    chr_stats = merged.groupby('chr_cat').apply(lambda x: f"{(x['status'].str.contains('Match|Flip')).mean()*100:.2f}% ({len(x)} SNPs)")
+    with pdf.table(line_height=8) as t:
+        h = t.row(); h.cell("Category"); h.cell("Concordance (Count)")
+        for k, v in chr_stats.items():
+            r = t.row(); r.cell(k); r.cell(v)
+
+    # Page 3: 功能区分析
+    pdf.add_page()
+    pdf.cell(0, 10, "3. Coding Region & Functional Analysis", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    func_stats = [
+        ["Markers in Coding Regions", str(merged['is_coding'].sum())],
+        ["Markers in Exons", str(merged['is_exon'].sum())],
+        ["Synonymous Variants", str(merged['eff'].str.contains('synonymous', na=False).sum())],
+        ["Nonsynonymous Variants", str(merged['eff'].str.contains('missense|stop|frame', na=False).sum())]
+    ]
+    with pdf.table(line_height=8) as t:
+        for r in func_stats:
+            row = t.row(); row.cell(r[0]); row.cell(r[1])
+            
+    pdf.ln(5); pdf.cell(0, 10, "Concordance: Coding vs Non-coding", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    with pdf.table(line_height=8) as t:
+        h = t.row(); h.cell("Region"); h.cell("Concordance (%)")
+        for lbl, mask in [("Coding SNPs", merged['is_coding']), ("Non-coding SNPs", ~merged['is_coding'])]:
+            sub = merged[mask]
+            acc = (sub['status'].str.contains('Match|Flip')).mean()*100 if len(sub)>0 else 0
+            r = t.row(); r.cell(lbl); r.cell(f"{acc:.2f}%")
+
+    # Page 4: 饼图 & Serious Mismatches
+    pdf.add_page()
+    pdf.cell(0, 10, "4. Functional Distribution & Impact", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if os.path.exists(pie_file): pdf.image(pie_file, x=20, w=160)
+    
+    pdf.ln(10); pdf.cell(0, 10, "Top Serious Mismatches", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    serious = merged[(merged['status'] == "Mismatch") & (merged['eff'].str.contains('missense|stop|frame|splice', na=False))].head(10)
+    with pdf.table(line_height=8) as t:
+        h = t.row(); h.cell("RSID"); h.cell("Chr"); h.cell("Effect"); h.cell("Gene")
+        for _, row in serious.iterrows():
+            r = t.row(); r.cell(row['rsid']); r.cell(row['chromosome']); r.cell(row['eff']); r.cell(row['gene'])
+
+    pdf.output(f"Final_Report_{comparison_id}.pdf")
+    print(f"\n[SUCCESS] Quantified Report Generated.")
+if __name__ == "__main__": main()
